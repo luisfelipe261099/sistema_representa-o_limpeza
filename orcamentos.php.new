@@ -1,0 +1,416 @@
+<?php
+session_start();
+
+// ===================================================================================
+// 1. SETUP INICIAL E INCLUSÃO DE BIBLIOTECAS
+// ===================================================================================
+
+// Habilita exibição de erros para depuração (remover em produção)
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// Verifica se o usuário está logado
+if (!isset($_SESSION["loggedin"]) || $_SESSION["loggedin"] !== true) {
+    header("location: index.php");
+    exit;
+}
+
+// Inclui PHPMailer e conexão com o banco
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+
+// Adapte o caminho conforme sua estrutura. Ex: 'vendor/autoload.php' se usar Composer
+require 'PHPMailer/src/Exception.php';
+require 'PHPMailer/src/PHPMailer.php';
+require 'PHPMailer/src/SMTP.php';
+
+require_once 'includes/db_connect.php';
+
+// ===================================================================================
+// 2. DEFINIÇÃO DE FUNÇÕES AUXILIARES
+// ===================================================================================
+
+/**
+ * Registra uma mudança de status de um orçamento na tabela de histórico.
+ */
+function registrarHistoricoOrcamento($conn, $orcamento_id, $status_anterior, $status_novo, $observacoes = '') {
+    if ($status_anterior === $status_novo) return true; // Não registra se o status for o mesmo
+
+    $usuario_id = $_SESSION['id'] ?? null;
+    $status_anterior_db = $status_anterior ?? 'criado';
+    
+    $sql = "INSERT INTO historico_orcamentos (orcamento_id, status_anterior, status_novo, observacoes, data_alteracao, usuario_id)
+            VALUES (?, ?, ?, ?, NOW(), ?)";
+            
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("isssi", $orcamento_id, $status_anterior_db, $status_novo, $observacoes, $usuario_id);
+    return $stmt->execute();
+}
+
+/**
+ * Gera o conteúdo de um PDF como string.
+ * Implementação com biblioteca FPDF
+ */
+function gerarPDFComoString($orcamento_id, $conn) {
+    try {
+        // Busca dados do orçamento, cliente e itens
+        $sql_orcamento = "SELECT o.*, c.nome AS nome_cliente, c.email FROM orcamentos o JOIN clientes c ON o.cliente_id = c.id WHERE o.id = ?";
+        $stmt = $conn->prepare($sql_orcamento);
+        $stmt->bind_param("i", $orcamento_id);
+        $stmt->execute();
+        $orcamento = $stmt->get_result()->fetch_assoc();
+        
+        if (!$orcamento) {
+            throw new Exception("Orçamento não encontrado");
+        }
+
+        $sql_itens = "SELECT i.*, p.nome AS nome_produto FROM itens_orcamento i JOIN produtos p ON i.produto_id = p.id WHERE i.orcamento_id = ?";
+        $stmt_itens = $conn->prepare($sql_itens);
+        $stmt_itens->bind_param("i", $orcamento_id);
+        $stmt_itens->execute();
+        $itens = $stmt_itens->get_result();
+
+        // Caminho correto para FPDF no vendor
+        require_once('vendor/setasign/fpdf/fpdf.php');
+        
+        $pdf = new FPDF();
+        $pdf->AddPage();
+        $pdf->SetFont('Arial','B',16);
+        $pdf->Cell(0,10,utf8_decode('Orçamento N°: ' . $orcamento['id']),0,1,'C');
+        
+        // Informações básicas
+        $pdf->Ln(10);
+        $pdf->SetFont('Arial','B',12);
+        $pdf->Cell(0,10,utf8_decode('Informações do Orçamento'),0,1);
+        
+        $pdf->SetFont('Arial','',12);
+        $pdf->Cell(40,7,utf8_decode('Cliente:'),0);
+        $pdf->Cell(0,7,utf8_decode($orcamento['nome_cliente']),0,1);
+        
+        $pdf->Cell(40,7,utf8_decode('Data:'),0);
+        $pdf->Cell(0,7,utf8_decode(date('d/m/Y', strtotime($orcamento['data_orcamento']))),0,1);
+        
+        $pdf->Cell(40,7,utf8_decode('Status:'),0);
+        $pdf->Cell(0,7,utf8_decode(ucfirst($orcamento['status_orcamento'])),0,1);
+        
+        // Tabela de itens
+        $pdf->Ln(10);
+        $pdf->SetFont('Arial','B',12);
+        $pdf->Cell(0,10,utf8_decode('Itens do Orçamento'),0,1);
+        
+        // Cabeçalho da tabela
+        $pdf->SetFillColor(230,230,230);
+        $pdf->SetFont('Arial','B',10);
+        $pdf->Cell(90,7,utf8_decode('Produto'),1,0,'C',true);
+        $pdf->Cell(25,7,utf8_decode('Quantidade'),1,0,'C',true);
+        $pdf->Cell(35,7,utf8_decode('Valor Unit.'),1,0,'C',true);
+        $pdf->Cell(40,7,utf8_decode('Subtotal'),1,1,'C',true);
+        
+        // Dados da tabela
+        $pdf->SetFont('Arial','',10);
+        $total = 0;
+        
+        while ($item = $itens->fetch_assoc()) {
+            $subtotal = $item['quantidade'] * $item['valor_unitario'];
+            $total += $subtotal;
+            
+            $pdf->Cell(90,7,utf8_decode($item['nome_produto']),1,0);
+            $pdf->Cell(25,7,$item['quantidade'],1,0,'C');
+            $pdf->Cell(35,7,'R$ '.number_format($item['valor_unitario'], 2, ',', '.'),1,0,'R');
+            $pdf->Cell(40,7,'R$ '.number_format($subtotal, 2, ',', '.'),1,1,'R');
+        }
+        
+        // Total
+        $pdf->SetFont('Arial','B',11);
+        $pdf->Cell(150,7,utf8_decode('Valor Total:'),1,0,'R');
+        $pdf->Cell(40,7,'R$ '.number_format($orcamento['valor_total'], 2, ',', '.'),1,1,'R');
+        
+        // Observações
+        if (!empty($orcamento['observacoes'])) {
+            $pdf->Ln(10);
+            $pdf->SetFont('Arial','B',12);
+            $pdf->Cell(0,7,utf8_decode('Observações:'),0,1);
+            $pdf->SetFont('Arial','',11);
+            $pdf->MultiCell(0,7,utf8_decode($orcamento['observacoes']),0);
+        }
+        
+        // Informações de rodapé
+        $pdf->Ln(15);
+        $pdf->SetFont('Arial','I',10);
+        $pdf->Cell(0,7,utf8_decode('Este orçamento é válido por 15 dias a partir da data de emissão.'),0,1,'C');
+        $pdf->Cell(0,7,utf8_decode('WK Produtos de Limpeza - (XX) XXXX-XXXX'),0,1,'C');
+        
+        return $pdf->Output('S'); // 'S' retorna o PDF como uma string
+    } catch (Exception $e) {
+        // Log do erro
+        error_log("Erro ao gerar PDF do orçamento #$orcamento_id: " . $e->getMessage());
+        throw $e; // Relança a exceção para ser tratada pelo chamador
+    }
+}
+
+// ===================================================================================
+// 3. BLOCO DE PROCESSAMENTO DE AÇÕES (POST e GET)
+// ===================================================================================
+
+// Ação de Mudar Status (via POST do Modal)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'change_status') {
+    $orcamento_id = intval($_POST['orcamento_id']);
+    $novo_status = $_POST['novo_status'];
+    $observacoes = trim($_POST['observacoes']);
+
+    // Busca o status anterior para o histórico
+    $stmt_get = $conn->prepare("SELECT status_orcamento FROM orcamentos WHERE id = ?");
+    $stmt_get->bind_param("i", $orcamento_id);
+    $stmt_get->execute();
+    $status_anterior = $stmt_get->get_result()->fetch_assoc()['status_orcamento'];
+
+    // Atualiza o status
+    $stmt_update = $conn->prepare("UPDATE orcamentos SET status_orcamento = ? WHERE id = ?");
+    $stmt_update->bind_param("si", $novo_status, $orcamento_id);
+    if ($stmt_update->execute()) {
+        registrarHistoricoOrcamento($conn, $orcamento_id, $status_anterior, $novo_status, $observacoes);
+        $_SESSION['message'] = "Status do orçamento #{$orcamento_id} atualizado para '{$novo_status}'.";
+        $_SESSION['message_type'] = 'success';
+    } else {
+        $_SESSION['message'] = "Erro ao atualizar o status do orçamento.";
+        $_SESSION['message_type'] = 'danger';
+    }
+    header("Location: orcamentos.php");
+    exit;
+}
+
+// Ação de Enviar E-mail (via GET)
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['action']) && $_GET['action'] === 'send_email') {
+    $orcamento_id = intval($_GET['id']);
+    
+    // Busca dados do cliente
+    $stmt_cli = $conn->prepare("SELECT c.nome, c.email, o.status_orcamento FROM clientes c JOIN orcamentos o ON c.id = o.cliente_id WHERE o.id = ?");
+    $stmt_cli->bind_param("i", $orcamento_id);
+    $stmt_cli->execute();
+    $data = $stmt_cli->get_result()->fetch_assoc();
+    
+    if ($data && !empty($data['email'])) {
+        $mail = new PHPMailer(true);
+        try {
+            // Carrega configurações do SMTP do arquivo de configuração
+            $email_config = include 'includes/email_config.php';
+            
+            // Configurações do Servidor SMTP
+            $mail->isSMTP();
+            $mail->Host       = $email_config['host'];
+            $mail->SMTPAuth   = true;
+            $mail->Username   = $email_config['username'];
+            $mail->Password   = $email_config['password'];
+            $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+            $mail->Port       = $email_config['port'];
+            $mail->CharSet    = 'UTF-8';
+            
+            // Remetente e Destinatário
+            $mail->setFrom($email_config['from_email'], $email_config['from_name']);
+            $mail->addAddress($data['email'], $data['nome']);
+            
+            // Anexo (PDF gerado como string)
+            try {
+                $pdf_content = gerarPDFComoString($orcamento_id, $conn);
+                $mail->addStringAttachment($pdf_content, 'Orcamento_'.$orcamento_id.'.pdf');
+            } catch (Exception $pdf_error) {
+                error_log("Erro ao gerar PDF para orçamento #$orcamento_id: " . $pdf_error->getMessage());
+                throw new Exception("Não foi possível gerar o PDF: " . $pdf_error->getMessage());
+            }
+
+            // Conteúdo
+            $mail->isHTML(true);
+            $mail->Subject = 'Seu Orçamento (Nº ' . $orcamento_id . ') está pronto!';
+            $mail->Body    = "Olá, " . htmlspecialchars($data['nome']) . "!<br><br>Segue em anexo o orçamento solicitado.<br><br>Atenciosamente,<br>Karla Wollinge";
+            $mail->AltBody = "Olá, " . htmlspecialchars($data['nome']) . "! Segue em anexo o orçamento solicitado. Atenciosamente, Karla Wollinge.";
+            
+            $mail->send();
+            
+            // Registra no histórico
+            registrarHistoricoOrcamento($conn, $orcamento_id, $data['status_orcamento'], $data['status_orcamento'], "Orçamento enviado por e-mail para {$data['email']}.");
+            $_SESSION['message'] = "Orçamento enviado com sucesso para " . htmlspecialchars($data['email']) . "!";
+            $_SESSION['message_type'] = 'success';
+        } catch (Exception $e) {
+            error_log("Erro ao enviar e-mail para orçamento #$orcamento_id: " . $e->getMessage());
+            $_SESSION['message'] = "O e-mail não pôde ser enviado. Erro: " . $e->getMessage();
+            $_SESSION['message_type'] = 'danger';
+        }
+    } else {
+        $_SESSION['message'] = "Cliente sem e-mail cadastrado ou orçamento não encontrado.";
+        $_SESSION['message_type'] = 'warning';
+    }
+    header("Location: orcamentos.php");
+    exit;
+}
+
+// ===================================================================================
+// 4. BLOCO DE BUSCA DE DADOS E MENSAGENS FLASH
+// ===================================================================================
+
+$message = '';
+if (isset($_SESSION['message'])) {
+    $message = $_SESSION['message'];
+    $message_type = $_SESSION['message_type'];
+    unset($_SESSION['message'], $_SESSION['message_type']);
+}
+
+// Lógica para buscar todos os orçamentos para exibição
+$sql_select_orcamentos = "SELECT o.id, c.nome AS nome_cliente, o.data_orcamento, o.valor_total, o.status_orcamento
+                          FROM orcamentos o LEFT JOIN clientes c ON o.cliente_id = c.id
+                          ORDER BY o.id DESC";
+$result_orcamentos = $conn->query($sql_select_orcamentos);
+if (!$result_orcamentos) die("Erro na consulta de orçamentos: " . $conn->error);
+
+// Cálculo de estatísticas
+$orcamentos_data = $result_orcamentos->fetch_all(MYSQLI_ASSOC);
+$total_orcamentos = count($orcamentos_data);
+$stats = [
+    'pendentes' => 0, 'aprovados' => 0, 'rejeitados' => 0, 
+    'convertidos' => 0, 'valor_total_aprovados' => 0
+];
+foreach ($orcamentos_data as $row) {
+    if ($row['status_orcamento'] == 'pendente') $stats['pendentes']++;
+    if ($row['status_orcamento'] == 'aprovado') {
+        $stats['aprovados']++;
+        $stats['valor_total_aprovados'] += $row['valor_total'];
+    }
+    if ($row['status_orcamento'] == 'rejeitado') $stats['rejeitados']++;
+    if ($row['status_orcamento'] == 'convertido_venda') $stats['convertidos']++;
+}
+
+// ===================================================================================
+// 5. RENDERIZAÇÃO DA PÁGINA HTML
+// ===================================================================================
+
+include_once 'includes/header.php';
+?>
+
+<div class="page-header fade-in-up">
+    <h1 class="page-title"><i class="fas fa-file-invoice-dollar"></i> Gerenciamento de Orçamentos</h1>
+</div>
+
+<?php if (!empty($message)): ?>
+<div class="alert alert-<?php echo $message_type; ?> alert-dismissible fade show" role="alert">
+    <?php echo $message; ?>
+    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+</div>
+<?php endif; ?>
+
+<div class="row g-4 mb-4">
+    <div class="col-6 col-lg-3"><div class="stats-card primary"><div class="stats-icon primary"><i class="fas fa-file-invoice-dollar"></i></div><div class="stats-value"><?php echo $total_orcamentos; ?></div><div class="stats-label">Total</div></div></div>
+    <div class="col-6 col-lg-3"><div class="stats-card warning"><div class="stats-icon warning"><i class="fas fa-clock"></i></div><div class="stats-value"><?php echo $stats['pendentes']; ?></div><div class="stats-label">Pendentes</div></div></div>
+    <div class="col-6 col-lg-3"><div class="stats-card success"><div class="stats-icon success"><i class="fas fa-check-circle"></i></div><div class="stats-value"><?php echo $stats['aprovados']; ?></div><div class="stats-label">Aprovados</div></div></div>
+    <div class="col-6 col-lg-3"><div class="stats-card info"><div class="stats-icon info"><i class="fas fa-exchange-alt"></i></div><div class="stats-value"><?php echo $stats['convertidos']; ?></div><div class="stats-label">Convertidos</div></div></div>
+</div>
+
+<div class="modern-card">
+    <div class="card-header-modern d-flex justify-content-between align-items-center">
+        <span><i class="fas fa-list"></i> Lista de Orçamentos</span>
+        <a href="criar_orcamento.php" class="btn btn-primary btn-sm"><i class="fas fa-plus me-2"></i> Novo Orçamento</a>
+    </div>
+    <div class="card-body-modern">
+        <div class="table-responsive">
+            <table class="table table-hover table-striped">
+                <thead>
+                    <tr>
+                        <th>ID</th><th>Cliente</th><th>Data</th><th>Valor</th><th>Status</th><th class="text-center">Ações</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if ($total_orcamentos > 0): ?>
+                        <?php foreach ($orcamentos_data as $row): ?>
+                            <?php
+                            $status_class = '';
+                            switch ($row['status_orcamento']) {
+                                case 'aprovado': $status_class = 'bg-success'; break;
+                                case 'pendente': $status_class = 'bg-warning text-dark'; break;
+                                case 'rejeitado': $status_class = 'bg-danger'; break;
+                                case 'convertido_venda': $status_class = 'bg-info'; break;
+                                default: $status_class = 'bg-secondary';
+                            }
+                            ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($row['id']); ?></td>
+                                <td><?php echo htmlspecialchars($row['nome_cliente']); ?></td>
+                                <td><?php echo date('d/m/Y', strtotime($row['data_orcamento'])); ?></td>
+                                <td>R$ <?php echo number_format($row['valor_total'], 2, ',', '.'); ?></td>
+                                <td><span class="badge <?php echo $status_class; ?>"><?php echo htmlspecialchars(ucfirst(str_replace('_', ' ', $row['status_orcamento']))); ?></span></td>
+                                <td class="text-center">
+                                    <a href="detalhes_orcamento.php?id=<?php echo $row['id']; ?>" class="btn btn-sm btn-outline-info" title="Ver Detalhes"><i class="fas fa-eye"></i></a>
+                                    <a href="gerar_pdf_orcamento.php?id=<?php echo $row['id']; ?>" class="btn btn-sm btn-outline-danger" title="Baixar PDF" target="_blank"><i class="fas fa-file-pdf"></i></a>
+                                    <a href="orcamentos.php?action=send_email&id=<?php echo $row['id']; ?>" class="btn btn-sm btn-outline-secondary" title="Enviar por E-mail" onclick="return confirm('Deseja enviar este orçamento por e-mail para o cliente?');"><i class="fas fa-envelope"></i></a>
+                                    
+                                    <?php if ($row['status_orcamento'] == 'pendente' || $row['status_orcamento'] == 'aprovado'): ?>
+                                        <button type="button" class="btn btn-sm btn-outline-warning" title="Mudar Status" data-bs-toggle="modal" data-bs-target="#statusModal" data-id="<?php echo $row['id']; ?>">
+                                            <i class="fas fa-sync-alt"></i>
+                                        </button>
+                                    <?php endif; ?>
+                                    
+                                    <?php if ($row['status_orcamento'] == 'aprovado'): ?>
+                                        <a href="registrar_venda.php?from_orcamento_id=<?php echo $row['id']; ?>" class="btn btn-sm btn-success" title="Converter para Venda"><i class="fas fa-exchange-alt"></i></a>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <tr><td colspan="6" class="text-center">Nenhum orçamento registrado.</td></tr>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="statusModal" tabindex="-1" aria-labelledby="statusModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form action="orcamentos.php" method="POST">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="statusModalLabel">Alterar Status do Orçamento</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" name="action" value="change_status">
+                    <input type="hidden" name="orcamento_id" id="modal_orcamento_id">
+                    
+                    <div class="mb-3">
+                        <label for="novo_status" class="form-label">Novo Status</label>
+                        <select name="novo_status" id="novo_status" class="form-select" required>
+                            <option value="aprovado">Aprovado</option>
+                            <option value="rejeitado">Rejeitado</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label for="observacoes" class="form-label">Observações (Opcional)</label>
+                        <textarea name="observacoes" id="observacoes" class="form-control" rows="3" placeholder="Ex: Cliente aprovou por telefone."></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary">Salvar Alteração</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+
+<?php
+$conn->close();
+include_once 'includes/footer.php';
+?>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    var statusModal = document.getElementById('statusModal');
+    statusModal.addEventListener('show.bs.modal', function (event) {
+        // Botão que acionou o modal
+        var button = event.relatedTarget;
+        // Extrai o ID do atributo data-id
+        var orcamentoId = button.getAttribute('data-id');
+        // Atualiza o valor do input no formulário do modal
+        var modalInput = statusModal.querySelector('#modal_orcamento_id');
+        modalInput.value = orcamentoId;
+    });
+});
+</script>
